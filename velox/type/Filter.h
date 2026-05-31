@@ -817,6 +817,22 @@ class BigintRange final : public Filter {
     return !(min > upper_ || max < lower_);
   }
 
+  bool testInt128(const int128_t& value) const final {
+    return value >= static_cast<int128_t>(lower_) &&
+        value <= static_cast<int128_t>(upper_);
+  }
+
+  bool testInt128Range(
+      const int128_t& min,
+      const int128_t& max,
+      bool hasNull) const final {
+    if (hasNull && nullAllowed_) {
+      return true;
+    }
+    return !(min > static_cast<int128_t>(upper_) ||
+             max < static_cast<int128_t>(lower_));
+  }
+
   int64_t lower() const {
     return lower_;
   }
@@ -900,6 +916,22 @@ class NegatedBigintRange final : public Filter {
     }
 
     return !(nonNegated_->lower() <= min && max <= nonNegated_->upper());
+  }
+
+  bool testInt128(const int128_t& value) const final {
+    return !nonNegated_->testInt128(value);
+  }
+
+  bool testInt128Range(
+      const int128_t& min,
+      const int128_t& max,
+      bool hasNull) const final {
+    if (hasNull && nullAllowed_) {
+      return true;
+    }
+    const int128_t lower = static_cast<int128_t>(nonNegated_->lower());
+    const int128_t upper = static_cast<int128_t>(nonNegated_->upper());
+    return !(lower <= min && max <= upper);
   }
 
   int64_t lower() const {
@@ -1151,6 +1183,14 @@ class BigintValuesUsingHashTable final : public Filter {
 
   bool testingEquals(const Filter& other) const final;
 
+  bool testInt128(const int128_t& value) const final {
+    if (value < static_cast<int128_t>(min_) ||
+        value > static_cast<int128_t>(max_)) {
+      return false;
+    }
+    return testInt64(static_cast<int64_t>(value));
+  }
+
  private:
   std::unique_ptr<Filter>
   mergeWith(int64_t min, int64_t max, const Filter* other) const;
@@ -1267,6 +1307,14 @@ class BigintValuesUsingBitmask final : public Filter {
     return bitmask_[value - min_];
   }
 
+  bool testInt128(const int128_t& value) const final {
+    if (value < static_cast<int128_t>(min_) ||
+        value > static_cast<int128_t>(max_)) {
+      return false;
+    }
+    return testInt64(static_cast<int64_t>(value));
+  }
+
   bool testInt64Range(int64_t min, int64_t max, bool hasNull) const final;
 
   std::unique_ptr<Filter> mergeWith(const Filter* other) const final;
@@ -1303,6 +1351,15 @@ class BigintValuesUsingBloomFilter final : public Filter {
 
   bool testInt64(int64_t value) const final {
     return filter_.mayContain(hash(value));
+  }
+
+  bool testInt128(const int128_t& value) const final {
+    // Bloom filter stores int64 hashes; values outside int64 range won't match.
+    if (value < static_cast<int128_t>(std::numeric_limits<int64_t>::min()) ||
+        value > static_cast<int128_t>(std::numeric_limits<int64_t>::max())) {
+      return false;
+    }
+    return testInt64(static_cast<int64_t>(value));
   }
 
   xsimd::batch_bool<int64_t> testValues(xsimd::batch<int64_t> x) const final {
@@ -1405,6 +1462,10 @@ class NegatedBigintValuesUsingHashTable final : public Filter {
     return !nonNegated_->testInt64(value);
   }
 
+  bool testInt128(const int128_t& value) const final {
+    return !nonNegated_->testInt128(value);
+  }
+
   xsimd::batch_bool<int64_t> testValues(xsimd::batch<int64_t> x) const final {
     return ~nonNegated_->testValues(x);
   }
@@ -1493,6 +1554,10 @@ class NegatedBigintValuesUsingBitmask final : public Filter {
 
   bool testInt64(int64_t value) const final {
     return !nonNegated_->testInt64(value);
+  }
+
+  bool testInt128(const int128_t& value) const final {
+    return !nonNegated_->testInt128(value);
   }
 
   bool testInt64Range(int64_t min, int64_t max, bool hasNull) const final;
@@ -2334,6 +2399,15 @@ class BigintMultiRange final : public Filter {
       std::optional<bool> nullAllowed = std::nullopt) const final;
 
   bool testInt64(int64_t value) const final;
+
+  bool testInt128(const int128_t& value) const final {
+    for (const auto& range : ranges_) {
+      if (range->testInt128(value)) {
+        return true;
+      }
+    }
+    return false;
+  }
 
   bool testInt64Range(int64_t min, int64_t max, bool hasNull) const final;
 
