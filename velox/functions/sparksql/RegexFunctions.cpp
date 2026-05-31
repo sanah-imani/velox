@@ -15,6 +15,7 @@
  */
 #include <folly/container/F14Map.h>
 #include "velox/functions/lib/Re2Functions.h"
+#include "velox/functions/lib/Utf8Utils.h"
 #include "velox/functions/lib/string/StringImpl.h"
 
 namespace facebook::velox::functions::sparksql {
@@ -40,10 +41,11 @@ void ensureRegexIsConstant(
 //
 // If position <= 0, throw error.
 // If position > length string, return string.
+//
+// Patterns that RE2 cannot compile (e.g. Perl-only syntax such as lookaheads)
+// are compiled with ICU, which matches Java's java.util.regex semantics.
 template <typename T>
 struct RegexpReplaceFunction {
-  RegexpReplaceFunction() : cache_(0) {}
-
   VELOX_DEFINE_FUNCTION_TYPES(T);
 
   static constexpr bool is_default_ascii_behavior = true;
@@ -66,19 +68,21 @@ struct RegexpReplaceFunction {
       const arg_type<int32_t>* /*position*/) {
     if (pattern) {
       const auto processedPattern = prepareRegexpReplacePattern(*pattern);
+      checkPatternUtf8(processedPattern);
       re_.emplace(processedPattern, RE2::Quiet);
-      VELOX_USER_CHECK(
-          re_->ok(),
-          "Invalid regular expression {}: {}.",
-          processedPattern,
-          re_->error());
-
-      if (replacement) {
-        // Only when both the 'replacement' and 'pattern' are constants can they
-        // be processed during initialization; otherwise, each row needs to be
-        // processed separately.
-        constantReplacement_ =
-            prepareRegexpReplaceReplacement(re_.value(), *replacement);
+      if (re_->ok()) {
+        if (replacement) {
+          constantReplacement_ =
+              prepareRegexpReplaceReplacement(re_.value(), *replacement);
+        }
+      } else {
+        // RE2 failed (e.g. Perl-only syntax like lookaheads). Try ICU, which
+        // matches Java's java.util.regex semantics used by Spark.
+        re_.reset();
+        icuRe_ = detail::compileIcuPattern(processedPattern);
+        if (replacement) {
+          constantReplacement_ = prepareIcuReplacement(*replacement);
+        }
       }
     }
     cache_.setMaxCompiledRegexes(config.exprMaxCompiledRegexes());
@@ -159,35 +163,67 @@ struct RegexpReplaceFunction {
       const arg_type<Varchar>& pattern,
       const arg_type<Varchar>& replace,
       const arg_type<int32_t>& position) {
-    auto& re = ensurePattern(pattern);
-    const auto& processedReplacement = constantReplacement_.has_value()
-        ? constantReplacement_.value()
-        : prepareRegexpReplaceReplacement(re, replace);
-
     std::string prefix(stringInput.data(), position);
     std::string targetString(
         stringInput.data() + position, stringInput.size() - position);
 
-    RE2::GlobalReplace(&targetString, re, processedReplacement);
+    if (re_.has_value()) {
+      // Constant RE2 pattern.
+      const auto& rep = constantReplacement_.has_value()
+          ? constantReplacement_.value()
+          : prepareRegexpReplaceReplacement(re_.value(), replace);
+      RE2::GlobalReplace(&targetString, re_.value(), rep);
+    } else if (icuRe_) {
+      // Constant ICU pattern (Perl-only syntax, e.g. lookaheads).
+      const auto& rep = constantReplacement_.has_value()
+          ? constantReplacement_.value()
+          : prepareIcuReplacement(replace);
+      targetString =
+          detail::applyIcuReplace(StringView(targetString), icuRe_.get(), rep);
+    } else {
+      // Non-constant pattern: compile on demand.
+      const auto processedPattern = prepareRegexpReplacePattern(pattern);
+      checkPatternUtf8(processedPattern);
+      auto compiled = cache_.findOrCompile(StringView(processedPattern));
+      if (compiled.usesIcu()) {
+        targetString = detail::applyIcuReplace(
+            StringView(targetString), compiled.icu, prepareIcuReplacement(replace));
+      } else {
+        const auto rep =
+            prepareRegexpReplaceReplacement(*compiled.re2, replace);
+        RE2::GlobalReplace(&targetString, *compiled.re2, rep);
+      }
+    }
     result = prefix + targetString;
   }
 
-  RE2& ensurePattern(const arg_type<Varchar>& pattern) {
-    if (re_.has_value()) {
-      return re_.value();
+  // Throws VeloxUserError if pattern is not valid UTF-8.
+  static void checkPatternUtf8(const std::string& pattern) {
+    const char* p = pattern.data();
+    const char* end = p + pattern.size();
+    while (p < end) {
+      int32_t codePoint;
+      int32_t len = tryGetUtf8CharLength(p, end - p, codePoint);
+      VELOX_USER_CHECK_GT(len, 0, "invalid UTF-8 in regular expression");
+      p += len;
     }
-    auto processedPattern = prepareRegexpReplacePattern(pattern);
-    return *cache_.findOrCompile(StringView(processedPattern));
   }
 
-  // Used when pattern is constant.
-  std::optional<RE2> re_;
+  // Constant RE2-compiled pattern; set in initialize() when pattern is const
+  // and RE2 can compile it.
+  std::optional<RE2> re_{};
 
-  // Used when replacement is constant.
-  std::optional<std::string> constantReplacement_;
+  // Constant ICU-compiled pattern; set in initialize() when pattern is const
+  // but RE2 cannot compile it (Perl-only syntax).
+  detail::IcuPatternPtr icuRe_{};
 
-  // Used when pattern is not constant.
-  detail::ReCache cache_;
+  // Preprocessed replacement, cached when both pattern and replacement are
+  // constant. For RE2 patterns this is RE2-formatted (\N groups); for ICU
+  // patterns this is the raw Java-style replacement ($N groups).
+  std::optional<std::string> constantReplacement_{};
+
+  // Cache for non-constant patterns.
+  detail::ReCache cache_{0};
 };
 
 } // namespace

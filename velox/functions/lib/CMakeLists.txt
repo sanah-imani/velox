@@ -101,7 +101,17 @@ velox_link_libraries(
   velox_common_hyperloglog
   re2::re2
   Folly::folly
+  ICU::i18n
+  ICU::uc
 )
+
+# When ICU is built from source (VELOX_ICU_SOURCE=BUNDLED), the individual
+# ICU component targets (ICU::i18n, ICU::uc) lack a build dependency on the
+# ICU ExternalProject. Without this, ninja may link velox_functions_lib against
+# empty placeholder .so files before ICU finishes building.
+if(TARGET ICU-build)
+  add_dependencies(velox_functions_lib ICU-build)
+endif()
 
 add_subdirectory(aggregates)
 add_subdirectory(sfm)

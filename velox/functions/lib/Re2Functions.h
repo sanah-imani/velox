@@ -157,10 +157,12 @@ class PatternMetadata {
   std::vector<std::string> substrings_;
 };
 
-/// The functions in this file use RE2 as the regex engine. RE2 is fast, but
-/// supports only a subset of PCRE syntax and in particular does not support
-/// backtracking and associated features (e.g. backreferences).
-/// See https://github.com/google/re2/wiki/Syntax for more information.
+/// The functions in this file use RE2 as the primary regex engine. RE2 is
+/// fast, but supports only a subset of PCRE syntax and in particular does not
+/// support backtracking and associated features (e.g. lookaheads, backreferences).
+/// When a pattern cannot be compiled by RE2, these functions fall back to ICU
+/// regex, which supports full PCRE/Perl syntax including lookaheads.
+/// See https://github.com/google/re2/wiki/Syntax for RE2 details.
 
 /// re2Match(string, pattern) → bool
 ///
@@ -252,11 +254,43 @@ std::vector<std::shared_ptr<exec::FunctionSignature>> re2ExtractAllSignatures();
 
 namespace detail {
 
-// A cache of compiled regular expressions (RE2 instances). Allows up to
-// 'expression.max_compiled_regexes' different expressions.
+/// Deleter for ICU regex patterns stored as void* to avoid ICU headers here.
+struct IcuPatternDeleter {
+  void operator()(void* p) const noexcept;
+};
+
+/// Owning pointer to a compiled icu::RegexPattern, type-erased to void*.
+using IcuPatternPtr = std::unique_ptr<void, IcuPatternDeleter>;
+
+/// Compiles pattern with ICU regex. Throws VeloxUserError on invalid pattern.
+IcuPatternPtr compileIcuPattern(const std::string& pattern);
+
+/// Applies ICU-based global replacement. pattern must be a valid IcuPatternPtr.
+std::string applyIcuReplace(
+    StringView str,
+    void* pattern,
+    const std::string& replacement);
+
+/// Non-owning view of a compiled regex, backed by either RE2 or ICU.
+/// Exactly one of re2/icu is non-null.
+struct CompiledRegex {
+  RE2* re2{nullptr};
+  // Actually icu::RegexPattern*, stored as void* to avoid ICU headers here.
+  void* icu{nullptr};
+
+  bool usesIcu() const noexcept {
+    return icu != nullptr;
+  }
+};
+
+// A cache of compiled regular expressions (RE2 or ICU instances). Allows up
+// to 'expression.max_compiled_regexes' different expressions.
 //
 // Compiling regular expressions is expensive. It can take up to 200 times
 // more CPU time to compile a regex vs. evaluate it.
+//
+// RE2 is tried first. If RE2 cannot compile the pattern (e.g. because it
+// contains Perl-only syntax like lookaheads), ICU regex is used instead.
 class ReCache {
  public:
   explicit ReCache(uint64_t maxCompiledRegexes)
@@ -266,28 +300,58 @@ class ReCache {
     maxCompiledRegexes_ = maxCompiledRegexes;
   }
 
-  RE2* findOrCompile(const StringView& pattern);
+  CompiledRegex findOrCompile(const StringView& pattern);
 
-  Expected<RE2*> tryFindOrCompile(const StringView& pattern);
+  Expected<CompiledRegex> tryFindOrCompile(const StringView& pattern);
 
  private:
-  folly::F14FastMap<std::string, std::unique_ptr<RE2>> cache_;
+  folly::F14FastMap<std::string, std::unique_ptr<RE2>> re2Cache_;
+  folly::F14FastMap<std::string, IcuPatternPtr> icuCache_;
   uint64_t maxCompiledRegexes_;
 };
 
 } // namespace detail
+
+/// Prepares a replacement string for use with ICU regex replaceAll.
+/// Handles backslash-escape sequences: \$ → $ and \X → X for other chars.
+/// $N and ${name} group references are passed through unchanged.
+FOLLY_ALWAYS_INLINE std::string prepareIcuReplacement(
+    const StringView& replacement) {
+  if (replacement.size() == 0) {
+    return std::string{};
+  }
+  std::string result;
+  result.reserve(replacement.size());
+  for (size_t i = 0; i < replacement.size(); ++i) {
+    const char c = replacement.data()[i];
+    if (c == '\\' && i + 1 < replacement.size()) {
+      const char next = replacement.data()[i + 1];
+      if (next == '$' || next == '\\') {
+        // Keep as-is: ICU interprets \$ as literal $ and \\ as literal \.
+        result.push_back(c);
+        result.push_back(next);
+        ++i;
+      } else {
+        // Unescape: \X → X for all other characters.
+        result.push_back(next);
+        ++i;
+      }
+    } else {
+      result.push_back(c);
+    }
+  }
+  return result;
+}
 
 /// regexp_replace(string, pattern, replacement) -> string
 /// regexp_replace(string, pattern) -> string
 ///
 /// If string has substrings that match the given pattern, return a new string
 /// that has all the matched substrings replaced with the given replacement
-/// sequence or removed if no replacement sequence is provided. pattern will
-/// be parsed using the RE2 pattern syntax, a subset of PCRE. If pattern is
-/// invalid for RE2, this function throws an exception. replacement is a string
-/// that may contain references to the named or numbered capturing groups in the
-/// pattern. If referenced capturing group names in replacement are invalid for
-/// RE2, this function throws an exception.
+/// sequence or removed if no replacement sequence is provided. Patterns that
+/// RE2 cannot compile (e.g. those using Perl-only lookahead syntax) are
+/// handled by ICU regex instead. replacement is a string that may contain
+/// references to the named or numbered capturing groups in the pattern.
 template <
     typename T,
     std::string (*prepareRegexpPattern)(const StringView&),
@@ -306,21 +370,22 @@ struct Re2RegexpReplace {
     if (pattern != nullptr) {
       const auto processedPattern = prepareRegexpPattern(*pattern);
       re_.emplace(processedPattern, RE2::Quiet);
-      VELOX_USER_CHECK(
-          re_->ok(),
-          "Invalid regular expression {}: {}.",
-          processedPattern,
-          re_->error());
+      if (!re_->ok()) {
+        // RE2 failed — try ICU as fallback for Perl-only syntax.
+        re_.reset();
+        icuRe_ = detail::compileIcuPattern(processedPattern);
+      }
     }
     cache_.setMaxCompiledRegexes(config.exprMaxCompiledRegexes());
 
-    if (replacement != nullptr) {
-      // Constant 'replacement' with non-constant 'pattern' needs to be
-      // processed separately for each row.
-      if (pattern != nullptr) {
-        ensureProcessedReplacement(re_.value(), *replacement);
-        constantReplacement_ = true;
+    if (replacement != nullptr && pattern != nullptr) {
+      if (icuRe_) {
+        processedReplacement_ = prepareIcuReplacement(*replacement);
+      } else {
+        processedReplacement_ =
+            prepareRegexpReplacement(re_.value(), *replacement);
       }
+      constantReplacement_ = true;
     }
   }
 
@@ -337,50 +402,53 @@ struct Re2RegexpReplace {
       const arg_type<Varchar>& string,
       const arg_type<Varchar>& pattern,
       const arg_type<Varchar>& replacement = StringView{}) {
-    auto& re = ensurePattern(pattern);
-    const auto& processedReplacement =
-        ensureProcessedReplacement(re, replacement);
-
-    result_.assign(string.data(), string.size());
-    RE2::GlobalReplace(&result_, re, processedReplacement);
-
+    if (icuRe_) {
+      // Constant ICU pattern.
+      if (!constantReplacement_) {
+        processedReplacement_ = prepareIcuReplacement(replacement);
+      }
+      result_ = detail::applyIcuReplace(string, icuRe_.get(), processedReplacement_);
+    } else if (re_.has_value()) {
+      // Constant RE2 pattern.
+      if (!constantReplacement_) {
+        processedReplacement_ =
+            prepareRegexpReplacement(re_.value(), replacement);
+      }
+      result_.assign(string.data(), string.size());
+      RE2::GlobalReplace(&result_, re_.value(), processedReplacement_);
+    } else {
+      // Non-constant pattern: look up in cache.
+      const auto processedPattern = prepareRegexpPattern(pattern);
+      auto compiled = cache_.findOrCompile(StringView(processedPattern));
+      if (compiled.usesIcu()) {
+        const auto repl = prepareIcuReplacement(replacement);
+        result_ = detail::applyIcuReplace(string, compiled.icu, repl);
+      } else {
+        const auto repl = prepareRegexpReplacement(*compiled.re2, replacement);
+        result_.assign(string.data(), string.size());
+        RE2::GlobalReplace(&result_, *compiled.re2, repl);
+      }
+    }
     UDFOutputString::assign(out, result_);
   }
 
  private:
-  RE2& ensurePattern(const arg_type<Varchar>& pattern) {
-    if (!re_.has_value()) {
-      auto processedPattern = prepareRegexpPattern(pattern);
-      return *cache_.findOrCompile(StringView(processedPattern));
-    } else {
-      return re_.value();
-    }
-  }
-
-  const std::string& ensureProcessedReplacement(
-      RE2& re,
-      const arg_type<Varchar>& replacement) {
-    if (!constantReplacement_) {
-      processedReplacement_ = prepareRegexpReplacement(re, replacement);
-    }
-
-    return processedReplacement_;
-  }
-
-  // Used when pattern is constant.
+  // Used when pattern is constant and RE2 compiled successfully.
   std::optional<RE2> re_;
+
+  // Used when pattern is constant and RE2 failed (ICU fallback).
+  detail::IcuPatternPtr icuRe_;
 
   // True if replacement is constant.
   bool constantReplacement_{false};
 
-  // Constant replacement if 'constantReplacement_' is true, or 'current'
-  // replacement.
+  // Processed replacement string (cached when replacement is constant).
   std::string processedReplacement_;
 
   // Used when pattern is not constant.
   detail::ReCache cache_;
 
-  // Scratch memory to store result of replacement.
+  // Scratch memory for the replacement result.
   std::string result_;
 };
 

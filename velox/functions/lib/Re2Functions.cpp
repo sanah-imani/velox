@@ -17,6 +17,9 @@
 #include "velox/functions/lib/string/StringImpl.h"
 #include "velox/vector/FunctionVector.h"
 
+#include <unicode/regex.h>
+#include <unicode/utext.h>
+
 namespace facebook::velox::functions {
 namespace {
 
@@ -33,37 +36,247 @@ re2::StringPiece toStringPiece(const T& s) {
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// ICU helper functions
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Returns the number of capturing groups in an ICU pattern.
+int32_t icuGroupCount(const icu::RegexPattern& pattern) {
+  UErrorCode status = U_ZERO_ERROR;
+  std::unique_ptr<icu::RegexMatcher> m(pattern.matcher(status));
+  return (U_SUCCESS(status) && m) ? m->groupCount() : 0;
+}
+
+// Creates a RegexMatcher from a compiled pattern with a UTF-8 UText as input.
+// The UText must remain valid for the lifetime of the returned matcher.
+std::unique_ptr<icu::RegexMatcher> icuMatcher(
+    const icu::RegexPattern& pattern,
+    UText* ut,
+    UErrorCode& status) {
+  std::unique_ptr<icu::RegexMatcher> m(pattern.matcher(status));
+  if (U_SUCCESS(status) && m) {
+    m->reset(ut);
+  }
+  return m;
+}
+
+// Full-string match (equivalent to RE2::FullMatch).
+bool icuFullMatch(StringView str, const icu::RegexPattern& pattern) {
+  UErrorCode status = U_ZERO_ERROR;
+  UText* ut = utext_openUTF8(nullptr, str.data(), str.size(), &status);
+  if (U_FAILURE(status)) {
+    return false;
+  }
+  auto m = icuMatcher(pattern, ut, status);
+  const bool result =
+      U_SUCCESS(status) && m && m->matches(status) && U_SUCCESS(status);
+  utext_close(ut);
+  return result;
+}
+
+// Partial match — returns true if any substring matches (RE2::PartialMatch).
+bool icuPartialMatch(StringView str, const icu::RegexPattern& pattern) {
+  UErrorCode status = U_ZERO_ERROR;
+  UText* ut = utext_openUTF8(nullptr, str.data(), str.size(), &status);
+  if (U_FAILURE(status)) {
+    return false;
+  }
+  auto m = icuMatcher(pattern, ut, status);
+  const bool result =
+      U_SUCCESS(status) && m && m->find(status) && U_SUCCESS(status);
+  utext_close(ut);
+  return result;
+}
+
+// Extracts one group from the first match of pattern in the row's string.
+// Uses byte offsets (via start64/end64 on a UTF-8 UText) so the result is a
+// zero-copy StringView into the original buffer. Mirrors re2Extract.
+bool icuExtract(
+    FlatVector<StringView>& result,
+    int row,
+    const icu::RegexPattern& pattern,
+    const exec::LocalDecodedVector& strs,
+    int32_t groupId,
+    bool emptyNoMatch) {
+  const StringView str = strs->valueAt<StringView>(row);
+  UErrorCode status = U_ZERO_ERROR;
+  UText* ut = utext_openUTF8(nullptr, str.data(), str.size(), &status);
+  if (U_FAILURE(status)) {
+    result.setNull(row, true);
+    return false;
+  }
+  auto m = icuMatcher(pattern, ut, status);
+  const bool found =
+      U_SUCCESS(status) && m && m->find(status) && U_SUCCESS(status);
+  if (!found) {
+    utext_close(ut);
+    if (emptyNoMatch) {
+      result.setNoCopy(row, StringView(nullptr, 0));
+      return false;
+    }
+    result.setNull(row, true);
+    return false;
+  }
+  // start64/end64 return byte offsets into the UTF-8 UText.
+  const int64_t startByte = m->start64(groupId, status);
+  const int64_t endByte = m->end64(groupId, status);
+  utext_close(ut);
+  if (U_FAILURE(status) || startByte < 0) {
+    if (emptyNoMatch) {
+      result.setNoCopy(row, StringView(nullptr, 0));
+      return false;
+    }
+    result.setNull(row, true);
+    return false;
+  }
+  const StringView extracted(str.data() + startByte, endByte - startByte);
+  result.setNoCopy(row, extracted);
+  return !StringView::isInline(extracted.size());
+}
+
+// Collects all matches of groupId from pattern in a single input string.
+// Uses byte offsets for zero-copy result references. Mirrors re2ExtractAll.
+void icuExtractAll(
+    exec::VectorWriter<Array<Varchar>>& resultWriter,
+    const icu::RegexPattern& pattern,
+    const exec::LocalDecodedVector& inputStrs,
+    const int row,
+    int32_t groupId) {
+  resultWriter.setOffset(row);
+  auto& arrayWriter = resultWriter.current();
+
+  const StringView str = inputStrs->valueAt<StringView>(row);
+  UErrorCode status = U_ZERO_ERROR;
+  UText* ut = utext_openUTF8(nullptr, str.data(), str.size(), &status);
+  if (U_FAILURE(status)) {
+    resultWriter.commit();
+    return;
+  }
+  auto m = icuMatcher(pattern, ut, status);
+  if (U_FAILURE(status) || !m) {
+    utext_close(ut);
+    resultWriter.commit();
+    return;
+  }
+  // ICU automatically advances past zero-length matches in find().
+  while (m->find(status) && U_SUCCESS(status)) {
+    const int64_t startByte = m->start64(groupId, status);
+    const int64_t endByte = m->end64(groupId, status);
+    if (U_FAILURE(status) || startByte < 0) {
+      arrayWriter.add_null();
+      status = U_ZERO_ERROR;
+      continue;
+    }
+    arrayWriter.add_item().setNoCopy(
+        StringView(str.data() + startByte, endByte - startByte));
+  }
+  utext_close(ut);
+  resultWriter.commit();
+}
+
+} // namespace
+
+// ICU global replace.
+std::string icuGlobalReplace(
+    StringView str,
+    const icu::RegexPattern& pattern,
+    const std::string& replacement) {
+  UErrorCode status = U_ZERO_ERROR;
+  UText* ut = utext_openUTF8(nullptr, str.data(), str.size(), &status);
+  if (U_FAILURE(status)) {
+    return std::string(str.data(), str.size());
+  }
+  auto m = icuMatcher(pattern, ut, status);
+  icu::UnicodeString uResult;
+  if (U_SUCCESS(status) && m) {
+    uResult = m->replaceAll(icu::UnicodeString::fromUTF8(replacement), status);
+  }
+  utext_close(ut);
+  std::string utf8Result;
+  uResult.toUTF8String(utf8Result);
+  return utf8Result;
+}
+
 namespace detail {
 
-Expected<RE2*> ReCache::tryFindOrCompile(const StringView& pattern) {
-  const auto key = std::string(pattern);
+void IcuPatternDeleter::operator()(void* p) const noexcept {
+  delete static_cast<icu::RegexPattern*>(p);
+}
 
-  auto reIt = cache_.find(key);
-  if (reIt != cache_.end()) {
-    return reIt->second.get();
+IcuPatternPtr compileIcuPattern(const std::string& pattern) {
+  UErrorCode status = U_ZERO_ERROR;
+  UParseError pe;
+  IcuPatternPtr result(
+      icu::RegexPattern::compile(
+          icu::UnicodeString::fromUTF8(pattern), pe, status),
+      IcuPatternDeleter{});
+  VELOX_USER_CHECK(
+      U_SUCCESS(status), "Invalid regular expression: {}", pattern);
+  return result;
+}
+
+} // namespace detail
+
+namespace detail {
+
+Expected<CompiledRegex> ReCache::tryFindOrCompile(const StringView& pattern) {
+  const std::string key = pattern;
+
+  auto re2It = re2Cache_.find(key);
+  if (re2It != re2Cache_.end()) {
+    return CompiledRegex{re2It->second.get(), nullptr};
   }
 
-  if (cache_.size() >= maxCompiledRegexes_) {
+  auto icuIt = icuCache_.find(key);
+  if (icuIt != icuCache_.end()) {
+    return CompiledRegex{nullptr, icuIt->second.get()};
+  }
+
+  if (re2Cache_.size() + icuCache_.size() >= maxCompiledRegexes_) {
     return folly::makeUnexpected(
         Status::UserError("Max number of regex reached"));
   }
 
-  auto re = std::make_unique<RE2>(toStringPiece(pattern), RE2::Quiet);
-  if (!re->ok()) {
-    return folly::makeUnexpected(
-        Status::UserError("invalid regular expression:{}", re->error()));
+  // Try RE2 first.
+  auto re2 = std::make_unique<RE2>(toStringPiece(pattern), RE2::Quiet);
+  if (re2->ok()) {
+    auto [it, inserted] = re2Cache_.emplace(key, std::move(re2));
+    VELOX_CHECK(inserted);
+    return CompiledRegex{it->second.get(), nullptr};
   }
 
-  auto [it, inserted] = cache_.emplace(key, std::move(re));
-  VELOX_CHECK(inserted);
+  // RE2 failed — fall back to ICU for Perl-only syntax (e.g. lookaheads).
+  const std::string re2Error = re2->error();
+  UErrorCode status = U_ZERO_ERROR;
+  UParseError pe;
+  IcuPatternPtr icuPattern(
+      icu::RegexPattern::compile(
+          icu::UnicodeString::fromUTF8(key), pe, status),
+      IcuPatternDeleter{});
+  if (U_FAILURE(status)) {
+    return folly::makeUnexpected(
+        Status::UserError("invalid regular expression:{}", re2Error));
+  }
 
-  return it->second.get();
+  auto [it, inserted] = icuCache_.emplace(key, std::move(icuPattern));
+  VELOX_CHECK(inserted);
+  return CompiledRegex{nullptr, it->second.get()};
 }
 
-RE2* ReCache::findOrCompile(const StringView& pattern) {
+CompiledRegex ReCache::findOrCompile(const StringView& pattern) {
   return tryFindOrCompile(pattern).thenOrThrow(
       folly::identity,
       [&](const Status& status) { VELOX_USER_FAIL("{}", status.message()); });
+}
+
+std::string applyIcuReplace(
+    StringView str,
+    void* pattern,
+    const std::string& replacement) {
+  return icuGlobalReplace(
+      str, *static_cast<icu::RegexPattern*>(pattern), replacement);
 }
 
 } // namespace detail
@@ -116,6 +329,19 @@ bool re2FullMatch(StringView str, const RE2& re) {
 
 bool re2PartialMatch(StringView str, const RE2& re) {
   return RE2::PartialMatch(toStringPiece(str), re);
+}
+
+// Dispatch wrappers: RE2 or ICU depending on which engine compiled the pattern.
+bool doFullMatch(StringView str, const detail::CompiledRegex& re) {
+  return re.usesIcu()
+      ? icuFullMatch(str, *static_cast<icu::RegexPattern*>(re.icu))
+      : re2FullMatch(str, *re.re2);
+}
+
+bool doPartialMatch(StringView str, const detail::CompiledRegex& re) {
+  return re.usesIcu()
+      ? icuPartialMatch(str, *static_cast<icu::RegexPattern*>(re.icu))
+      : re2PartialMatch(str, *re.re2);
 }
 
 bool re2Extract(
@@ -213,11 +439,27 @@ std::string likePatternToRe2(
   return regex;
 }
 
-template <bool (*Fn)(StringView, const RE2&)>
+template <bool (*Fn)(StringView, const detail::CompiledRegex&)>
 class Re2MatchConstantPattern final : public exec::VectorFunction {
  public:
   explicit Re2MatchConstantPattern(StringView pattern)
-      : re_(toStringPiece(pattern), RE2::Quiet) {}
+      : re2_(toStringPiece(pattern), RE2::Quiet) {
+    if (re2_.ok()) {
+      compiled_ = {&re2_, nullptr};
+    } else {
+      UErrorCode status = U_ZERO_ERROR;
+      UParseError pe;
+      icu_.reset(icu::RegexPattern::compile(
+          icu::UnicodeString::fromUTF8(
+              std::string(pattern.data(), pattern.size())),
+          pe,
+          status));
+      if (U_SUCCESS(status)) {
+        compiled_ = {nullptr, icu_.get()};
+      }
+      // compiled_ remains {nullptr,nullptr} if both failed; error surfaced in apply().
+    }
+  }
 
   void apply(
       const SelectivityVector& rows,
@@ -228,23 +470,31 @@ class Re2MatchConstantPattern final : public exec::VectorFunction {
     VELOX_CHECK_EQ(args.size(), 2);
     FlatVector<bool>& result = ensureWritableBool(rows, context, resultRef);
     exec::LocalDecodedVector toSearch(context, *args[0], rows);
-    try {
-      checkForBadPattern(re_);
-    } catch (const std::exception&) {
-      context.setErrors(rows, std::current_exception());
+    if (!compiled_.re2 && !compiled_.icu) {
+      auto error = std::make_exception_ptr(VeloxUserError(
+          __FILE__,
+          __LINE__,
+          __FUNCTION__,
+          "",
+          fmt::format("invalid regular expression:{}", re2_.error()),
+          error_source::kErrorSourceUser,
+          error_code::kInvalidArgument,
+          false));
+      context.setErrors(rows, error);
       return;
     }
-
     context.applyToSelectedNoThrow(rows, [&](vector_size_t i) {
-      result.set(i, Fn(toSearch->valueAt<StringView>(i), re_));
+      result.set(i, Fn(toSearch->valueAt<StringView>(i), compiled_));
     });
   }
 
  private:
-  RE2 re_;
+  RE2 re2_;
+  std::unique_ptr<icu::RegexPattern> icu_;
+  detail::CompiledRegex compiled_;
 };
 
-template <bool (*Fn)(StringView, const RE2&)>
+template <bool (*Fn)(StringView, const detail::CompiledRegex&)>
 class Re2Match final : public exec::VectorFunction {
  public:
   explicit Re2Match(int64_t maxCompiledRegexes) : cache_(maxCompiledRegexes) {}
@@ -271,8 +521,7 @@ class Re2Match final : public exec::VectorFunction {
         context.setStatus(row, tryRe.error());
         return;
       }
-      const auto& re = *tryRe.value();
-      result.set(row, Fn(toSearch->valueAt<StringView>(row), re));
+      result.set(row, Fn(toSearch->valueAt<StringView>(row), tryRe.value()));
     });
   }
 
@@ -286,13 +535,45 @@ void checkForBadGroupId(int64_t groupId, const RE2& re) {
   }
 }
 
+void checkForBadGroupId(int64_t groupId, const detail::CompiledRegex& compiled) {
+  const int32_t numGroups = compiled.usesIcu()
+      ? icuGroupCount(*static_cast<icu::RegexPattern*>(compiled.icu))
+      : compiled.re2->NumberOfCapturingGroups();
+  if (UNLIKELY(groupId < 0 || groupId > numGroups)) {
+    std::string pattern;
+    if (compiled.usesIcu()) {
+      UErrorCode status = U_ZERO_ERROR;
+      static_cast<icu::RegexPattern*>(compiled.icu)->pattern().toUTF8String(
+          pattern);
+    } else {
+      pattern = compiled.re2->pattern();
+    }
+    VELOX_USER_FAIL("No group {} in regex '{}'", groupId, pattern);
+  }
+}
+
 template <typename T>
 class Re2SearchAndExtractConstantPattern final : public exec::VectorFunction {
  public:
   explicit Re2SearchAndExtractConstantPattern(
       StringView pattern,
       bool emptyNoMatch)
-      : re_(toStringPiece(pattern), RE2::Quiet), emptyNoMatch_(emptyNoMatch) {}
+      : re2_(toStringPiece(pattern), RE2::Quiet), emptyNoMatch_(emptyNoMatch) {
+    if (re2_.ok()) {
+      compiled_ = {&re2_, nullptr};
+    } else {
+      UErrorCode status = U_ZERO_ERROR;
+      UParseError pe;
+      icu_.reset(icu::RegexPattern::compile(
+          icu::UnicodeString::fromUTF8(
+              std::string(pattern.data(), pattern.size())),
+          pe,
+          status));
+      if (U_SUCCESS(status)) {
+        compiled_ = {nullptr, icu_.get()};
+      }
+    }
+  }
 
   void apply(
       const SelectivityVector& rows,
@@ -301,78 +582,73 @@ class Re2SearchAndExtractConstantPattern final : public exec::VectorFunction {
       exec::EvalCtx& context,
       VectorPtr& resultRef) const final {
     VELOX_CHECK(args.size() == 2 || args.size() == 3);
-    // TODO: Potentially re-use the string vector, not just the buffer.
     FlatVector<StringView>& result =
         ensureWritableStringView(rows, context, resultRef);
 
-    // apply() will not be invoked if the selection is empty.
-    try {
-      checkForBadPattern(re_);
-    } catch (const std::exception&) {
-      context.setErrors(rows, std::current_exception());
+    if (!compiled_.re2 && !compiled_.icu) {
+      auto error = std::make_exception_ptr(VeloxUserError(
+          __FILE__,
+          __LINE__,
+          __FUNCTION__,
+          "",
+          fmt::format("invalid regular expression:{}", re2_.error()),
+          error_source::kErrorSourceUser,
+          error_code::kInvalidArgument,
+          false));
+      context.setErrors(rows, error);
       return;
     }
 
     exec::LocalDecodedVector toSearch(context, *args[0], rows);
     bool mustRefSourceStrings = false;
-    FOLLY_DECLARE_REUSED(groups, std::vector<re2::StringPiece>);
-    // Common case: constant group id.
-    if (args.size() == 2) {
-      groups.resize(1);
-      context.applyToSelectedNoThrow(rows, [&](vector_size_t i) {
-        mustRefSourceStrings |=
-            re2Extract(result, i, re_, toSearch, groups, 0, emptyNoMatch_);
-      });
-      if (mustRefSourceStrings) {
-        result.acquireSharedStringBuffers(toSearch->base());
-      }
-      return;
-    }
 
-    if (const auto groupId = getIfConstant<T>(*args[2])) {
+    auto doExtract = [&](vector_size_t i, int32_t groupId) {
+      if (compiled_.usesIcu()) {
+        mustRefSourceStrings |=
+            icuExtract(result, i, *static_cast<icu::RegexPattern*>(compiled_.icu), toSearch, groupId, emptyNoMatch_);
+      } else {
+        FOLLY_DECLARE_REUSED(groups, std::vector<re2::StringPiece>);
+        groups.resize(groupId + 1);
+        mustRefSourceStrings |=
+            re2Extract(result, i, *compiled_.re2, toSearch, groups, groupId, emptyNoMatch_);
+      }
+    };
+
+    if (args.size() == 2) {
+      context.applyToSelectedNoThrow(rows, [&](vector_size_t i) {
+        doExtract(i, 0);
+      });
+    } else if (const auto groupId = getIfConstant<T>(*args[2])) {
       try {
-        checkForBadGroupId(*groupId, re_);
+        checkForBadGroupId(*groupId, compiled_);
       } catch (const std::exception&) {
         context.setErrors(rows, std::current_exception());
         return;
       }
-
-      groups.resize(*groupId + 1);
       context.applyToSelectedNoThrow(rows, [&](vector_size_t i) {
-        mustRefSourceStrings |= re2Extract(
-            result, i, re_, toSearch, groups, *groupId, emptyNoMatch_);
+        doExtract(i, *groupId);
       });
-      if (mustRefSourceStrings) {
-        result.acquireSharedStringBuffers(toSearch->base());
-      }
-      return;
+    } else {
+      exec::LocalDecodedVector groupIds(context, *args[2], rows);
+      context.applyToSelectedNoThrow(rows, [&](vector_size_t i) {
+        T group = groupIds->valueAt<T>(i);
+        checkForBadGroupId(group, compiled_);
+        doExtract(i, group);
+      });
     }
 
-    // Less common case: variable group id. Resize the groups vector to
-    // number of capturing groups + 1.
-    exec::LocalDecodedVector groupIds(context, *args[2], rows);
-
-    groups.resize(re_.NumberOfCapturingGroups() + 1);
-    context.applyToSelectedNoThrow(rows, [&](vector_size_t i) {
-      T group = groupIds->valueAt<T>(i);
-      checkForBadGroupId(group, re_);
-      mustRefSourceStrings |=
-          re2Extract(result, i, re_, toSearch, groups, group, emptyNoMatch_);
-    });
     if (mustRefSourceStrings) {
       result.acquireSharedStringBuffers(toSearch->base());
     }
   }
 
  private:
-  RE2 re_;
-  // If true, returns empty string as result for no match case, which is Spark's
-  // behavior. Otherwise, returns null as result, which is Presto's behavior.
+  RE2 re2_;
+  std::unique_ptr<icu::RegexPattern> icu_;
+  detail::CompiledRegex compiled_;
   const bool emptyNoMatch_;
 };
 
-// The factory function we provide returns a unique instance for each call, so
-// this is safe.
 template <typename T>
 class Re2SearchAndExtract final : public exec::VectorFunction {
  public:
@@ -385,15 +661,12 @@ class Re2SearchAndExtract final : public exec::VectorFunction {
       exec::EvalCtx& context,
       VectorPtr& resultRef) const final {
     VELOX_CHECK(args.size() == 2 || args.size() == 3);
-    // Handle the common case of a constant pattern.
     if (auto pattern = getIfConstant<StringView>(*args[1])) {
       Re2SearchAndExtractConstantPattern<T>(*pattern, emptyNoMatch_)
           .apply(rows, args, outputType, context, resultRef);
       return;
     }
 
-    // The general case. Further optimizations are possible to avoid regex
-    // recompilation, but a constant pattern is by far the most common case.
     FlatVector<StringView>& result =
         ensureWritableStringView(rows, context, resultRef);
     exec::LocalDecodedVector toSearch(context, *args[0], rows);
@@ -408,10 +681,14 @@ class Re2SearchAndExtract final : public exec::VectorFunction {
           context.setStatus(i, tryRe.error());
           return;
         }
-        const auto& re = *tryRe.value();
-
-        mustRefSourceStrings |=
-            re2Extract(result, i, re, toSearch, groups, 0, emptyNoMatch_);
+        const auto compiled = tryRe.value();
+        if (compiled.usesIcu()) {
+          mustRefSourceStrings |=
+              icuExtract(result, i, *static_cast<icu::RegexPattern*>(compiled.icu), toSearch, 0, emptyNoMatch_);
+        } else {
+          mustRefSourceStrings |=
+              re2Extract(result, i, *compiled.re2, toSearch, groups, 0, emptyNoMatch_);
+        }
       });
     } else {
       exec::LocalDecodedVector groupIds(context, *args[2], rows);
@@ -422,12 +699,16 @@ class Re2SearchAndExtract final : public exec::VectorFunction {
           context.setStatus(i, tryRe.error());
           return;
         }
-
-        const auto& re = *tryRe.value();
-        checkForBadGroupId(groupId, re);
-        groups.resize(groupId + 1);
-        mustRefSourceStrings |=
-            re2Extract(result, i, re, toSearch, groups, groupId, emptyNoMatch_);
+        const auto compiled = tryRe.value();
+        checkForBadGroupId(groupId, compiled);
+        if (compiled.usesIcu()) {
+          mustRefSourceStrings |=
+              icuExtract(result, i, *static_cast<icu::RegexPattern*>(compiled.icu), toSearch, groupId, emptyNoMatch_);
+        } else {
+          groups.resize(groupId + 1);
+          mustRefSourceStrings |= re2Extract(
+              result, i, *compiled.re2, toSearch, groups, groupId, emptyNoMatch_);
+        }
       });
     }
     if (mustRefSourceStrings) {
@@ -1116,7 +1397,22 @@ template <typename T>
 class Re2ExtractAllConstantPattern final : public exec::VectorFunction {
  public:
   explicit Re2ExtractAllConstantPattern(StringView pattern)
-      : re_(toStringPiece(pattern), RE2::Quiet) {}
+      : re2_(toStringPiece(pattern), RE2::Quiet) {
+    if (re2_.ok()) {
+      compiled_ = {&re2_, nullptr};
+    } else {
+      UErrorCode status = U_ZERO_ERROR;
+      UParseError pe;
+      icu_.reset(icu::RegexPattern::compile(
+          icu::UnicodeString::fromUTF8(
+              std::string(pattern.data(), pattern.size())),
+          pe,
+          status));
+      if (U_SUCCESS(status)) {
+        compiled_ = {nullptr, icu_.get()};
+      }
+    }
+  }
 
   void apply(
       const SelectivityVector& rows,
@@ -1125,10 +1421,17 @@ class Re2ExtractAllConstantPattern final : public exec::VectorFunction {
       exec::EvalCtx& context,
       VectorPtr& resultRef) const final {
     VELOX_CHECK(args.size() == 2 || args.size() == 3);
-    try {
-      checkForBadPattern(re_);
-    } catch (const std::exception&) {
-      context.setErrors(rows, std::current_exception());
+    if (!compiled_.re2 && !compiled_.icu) {
+      auto error = std::make_exception_ptr(VeloxUserError(
+          __FILE__,
+          __LINE__,
+          __FUNCTION__,
+          "",
+          fmt::format("invalid regular expression:{}", re2_.error()),
+          error_source::kErrorSourceUser,
+          error_code::kInvalidArgument,
+          false));
+      context.setErrors(rows, error);
       return;
     }
 
@@ -1136,46 +1439,42 @@ class Re2ExtractAllConstantPattern final : public exec::VectorFunction {
         rows, ARRAY(VARCHAR()), context.pool(), resultRef);
     exec::VectorWriter<Array<Varchar>> resultWriter;
     resultWriter.init(*resultRef->as<ArrayVector>());
-
     exec::LocalDecodedVector inputStrs(context, *args[0], rows);
     FOLLY_DECLARE_REUSED(groups, std::vector<re2::StringPiece>);
 
+    auto doExtractAll = [&](vector_size_t row, int32_t groupId) {
+      if (compiled_.usesIcu()) {
+        icuExtractAll(resultWriter, *static_cast<icu::RegexPattern*>(compiled_.icu), inputStrs, row, groupId);
+      } else {
+        groups.resize(groupId + 1);
+        re2ExtractAll(resultWriter, *compiled_.re2, inputStrs, row, groups, groupId);
+      }
+    };
+
     if (args.size() == 2) {
-      // Case 1: No groupId -- use 0 as the default groupId
-      //
-      groups.resize(1);
       context.applyToSelectedNoThrow(rows, [&](vector_size_t row) {
-        re2ExtractAll(resultWriter, re_, inputStrs, row, groups, 0);
+        doExtractAll(row, 0);
       });
-    } else if (const auto _groupId = getIfConstant<T>(*args[2])) {
-      // Case 2: Constant groupId
-      //
+    } else if (const auto groupId = getIfConstant<T>(*args[2])) {
       try {
-        checkForBadGroupId(*_groupId, re_);
+        checkForBadGroupId(*groupId, compiled_);
       } catch (const std::exception&) {
         context.setErrors(rows, std::current_exception());
         return;
       }
-
-      groups.resize(*_groupId + 1);
       context.applyToSelectedNoThrow(rows, [&](vector_size_t row) {
-        re2ExtractAll(resultWriter, re_, inputStrs, row, groups, *_groupId);
+        doExtractAll(row, *groupId);
       });
     } else {
-      // Case 3: Variable groupId, so resize the groups vector to accommodate
-      // number of capturing groups + 1.
       exec::LocalDecodedVector groupIds(context, *args[2], rows);
-
-      groups.resize(re_.NumberOfCapturingGroups() + 1);
       context.applyToSelectedNoThrow(rows, [&](vector_size_t row) {
         const T groupId = groupIds->valueAt<T>(row);
-        checkForBadGroupId(groupId, re_);
-        re2ExtractAll(resultWriter, re_, inputStrs, row, groups, groupId);
+        checkForBadGroupId(groupId, compiled_);
+        doExtractAll(row, groupId);
       });
     }
 
     resultWriter.finish();
-
     resultRef->as<ArrayVector>()
         ->elements()
         ->asFlatVector<StringView>()
@@ -1183,7 +1482,9 @@ class Re2ExtractAllConstantPattern final : public exec::VectorFunction {
   }
 
  private:
-  RE2 re_;
+  RE2 re2_;
+  std::unique_ptr<icu::RegexPattern> icu_;
+  detail::CompiledRegex compiled_;
 };
 
 template <typename T>
@@ -1199,8 +1500,6 @@ class Re2ExtractAll final : public exec::VectorFunction {
       exec::EvalCtx& context,
       VectorPtr& resultRef) const final {
     VELOX_CHECK(args.size() == 2 || args.size() == 3);
-    // Use Re2ExtractAllConstantPattern if it's constant regexp pattern.
-    //
     if (auto pattern = getIfConstant<StringView>(*args[1])) {
       Re2ExtractAllConstantPattern<T>(*pattern).apply(
           rows, args, outputType, context, resultRef);
@@ -1211,27 +1510,26 @@ class Re2ExtractAll final : public exec::VectorFunction {
         rows, ARRAY(VARCHAR()), context.pool(), resultRef);
     exec::VectorWriter<Array<Varchar>> resultWriter;
     resultWriter.init(*resultRef->as<ArrayVector>());
-
     exec::LocalDecodedVector inputStrs(context, *args[0], rows);
     exec::LocalDecodedVector pattern(context, *args[1], rows);
     FOLLY_DECLARE_REUSED(groups, std::vector<re2::StringPiece>);
 
     if (args.size() == 2) {
-      // Case 1: No groupId -- use 0 as the default groupId
-      //
-      groups.resize(1);
       context.applyToSelectedNoThrow(rows, [&](vector_size_t row) {
         auto tryRe = cache_.tryFindOrCompile(pattern->valueAt<StringView>(row));
         if (tryRe.hasError()) {
           context.setStatus(row, tryRe.error());
           return;
         }
-        const auto& re = *tryRe.value();
-        re2ExtractAll(resultWriter, re, inputStrs, row, groups, 0);
+        const auto compiled = tryRe.value();
+        if (compiled.usesIcu()) {
+          icuExtractAll(resultWriter, *static_cast<icu::RegexPattern*>(compiled.icu), inputStrs, row, 0);
+        } else {
+          groups.resize(1);
+          re2ExtractAll(resultWriter, *compiled.re2, inputStrs, row, groups, 0);
+        }
       });
     } else {
-      // Case 2: Has groupId
-      //
       exec::LocalDecodedVector groupIds(context, *args[2], rows);
       context.applyToSelectedNoThrow(rows, [&](vector_size_t row) {
         const T groupId = groupIds->valueAt<T>(row);
@@ -1240,10 +1538,15 @@ class Re2ExtractAll final : public exec::VectorFunction {
           context.setStatus(row, tryRe.error());
           return;
         }
-        const auto& re = *tryRe.value();
-        checkForBadGroupId(groupId, re);
-        groups.resize(groupId + 1);
-        re2ExtractAll(resultWriter, re, inputStrs, row, groups, groupId);
+        const auto compiled = tryRe.value();
+        checkForBadGroupId(groupId, compiled);
+        if (compiled.usesIcu()) {
+          icuExtractAll(resultWriter, *static_cast<icu::RegexPattern*>(compiled.icu), inputStrs, row, groupId);
+        } else {
+          groups.resize(groupId + 1);
+          re2ExtractAll(
+              resultWriter, *compiled.re2, inputStrs, row, groups, groupId);
+        }
       });
     }
 
@@ -1258,7 +1561,7 @@ class Re2ExtractAll final : public exec::VectorFunction {
   mutable detail::ReCache cache_;
 };
 
-template <bool (*Fn)(StringView, const RE2&)>
+template <bool (*Fn)(StringView, const detail::CompiledRegex&)>
 std::shared_ptr<exec::VectorFunction> makeRe2MatchImpl(
     const std::string& name,
     const std::vector<exec::VectorFunctionArg>& inputArgs,
@@ -1593,50 +1896,84 @@ class RegexpReplaceWithLambdaFunction : public exec::VectorFunction {
         return;
       }
 
-      auto* re = reOrError.value();
-
-      const auto numGroups = re->NumberOfCapturingGroups();
-
+      const auto compiled = reOrError.value();
       const auto hay = strings.valueAt<StringView>(row);
-
       vector_size_t numMatchesPerRow = 0;
 
-      size_t pos = 0;
-      std::vector<re2::StringPiece> subMatches(numGroups + 1);
-      while (re->Match(
-          toStringPiece(hay),
-          pos,
-          hay.size(),
-          RE2::Anchor::UNANCHORED,
-          subMatches.data(),
-          numGroups + 1)) {
-        ++numMatchesPerRow;
-        matches.ensureSize(matchRow + 1);
-        matchesArrayWriter.setOffset(matchRow);
-        auto& arrayWriter = matchesArrayWriter.current();
-        for (auto i = 0; i < numGroups; i++) {
-          const auto subMatch = subMatches[i + 1];
-          if (subMatch.data() != nullptr) {
-            arrayWriter.add_item().setNoCopy(
-                StringView(subMatch.data(), subMatch.size()));
-          } else {
-            arrayWriter.add_null();
+      if (compiled.usesIcu()) {
+        UErrorCode status = U_ZERO_ERROR;
+        UText* ut = utext_openUTF8(nullptr, hay.data(), hay.size(), &status);
+        if (U_FAILURE(status)) {
+          return;
+        }
+        std::unique_ptr<icu::RegexMatcher> m(
+            icuMatcher(*static_cast<icu::RegexPattern*>(compiled.icu), ut, status));
+        if (U_FAILURE(status) || !m) {
+          utext_close(ut);
+          return;
+        }
+        const int32_t numGroups = m->groupCount();
+        while (m->find(status) && U_SUCCESS(status)) {
+          ++numMatchesPerRow;
+          matches.ensureSize(matchRow + 1);
+          matchesArrayWriter.setOffset(matchRow);
+          auto& arrayWriter = matchesArrayWriter.current();
+          for (int32_t i = 0; i < numGroups; i++) {
+            UErrorCode gs = U_ZERO_ERROR;
+            const int64_t gStart = m->start64(i + 1, gs);
+            const int64_t gEnd = m->end64(i + 1, gs);
+            if (U_FAILURE(gs) || gStart < 0) {
+              arrayWriter.add_null();
+            } else {
+              arrayWriter.add_item().setNoCopy(
+                  StringView(hay.data() + gStart, gEnd - gStart));
+            }
           }
+          matchesArrayWriter.commit();
+
+          const int64_t fullStart = m->start64(status);
+          const int64_t fullEnd = m->end64(status);
+          matches.setMatchOffsetAndSize(matchRow, fullStart, fullEnd - fullStart);
+          ++matchRow;
         }
-        matchesArrayWriter.commit();
+        utext_close(ut);
+      } else {
+        const auto* re = compiled.re2;
+        const auto numGroups = re->NumberOfCapturingGroups();
+        size_t pos = 0;
+        std::vector<re2::StringPiece> subMatches(numGroups + 1);
+        while (re->Match(
+            toStringPiece(hay),
+            pos,
+            hay.size(),
+            RE2::Anchor::UNANCHORED,
+            subMatches.data(),
+            numGroups + 1)) {
+          ++numMatchesPerRow;
+          matches.ensureSize(matchRow + 1);
+          matchesArrayWriter.setOffset(matchRow);
+          auto& arrayWriter = matchesArrayWriter.current();
+          for (auto i = 0; i < numGroups; i++) {
+            const auto subMatch = subMatches[i + 1];
+            if (subMatch.data() != nullptr) {
+              arrayWriter.add_item().setNoCopy(
+                  StringView(subMatch.data(), subMatch.size()));
+            } else {
+              arrayWriter.add_null();
+            }
+          }
+          matchesArrayWriter.commit();
 
-        const auto fullMatch = subMatches[0];
-
-        const auto offset = fullMatch.data() - hay.data();
-        const auto size = fullMatch.size();
-        matches.setMatchOffsetAndSize(matchRow, offset, size);
-
-        pos = offset + size;
-        if (UNLIKELY(size == 0)) {
-          ++pos;
+          const auto fullMatch = subMatches[0];
+          const auto offset = fullMatch.data() - hay.data();
+          const auto size = fullMatch.size();
+          matches.setMatchOffsetAndSize(matchRow, offset, size);
+          pos = offset + size;
+          if (UNLIKELY(size == 0)) {
+            ++pos;
+          }
+          ++matchRow;
         }
-
-        ++matchRow;
       }
 
       rawNumMatches[row] = numMatchesPerRow;
@@ -1657,7 +1994,7 @@ std::shared_ptr<exec::VectorFunction> makeRe2Match(
     const std::string& name,
     const std::vector<exec::VectorFunctionArg>& inputArgs,
     const core::QueryConfig& config) {
-  return makeRe2MatchImpl<re2FullMatch>(name, inputArgs, config);
+  return makeRe2MatchImpl<doFullMatch>(name, inputArgs, config);
 }
 
 std::vector<std::shared_ptr<exec::FunctionSignature>> re2MatchSignatures() {
@@ -1673,7 +2010,7 @@ std::shared_ptr<exec::VectorFunction> makeRe2Search(
     const std::string& name,
     const std::vector<exec::VectorFunctionArg>& inputArgs,
     const core::QueryConfig& config) {
-  return makeRe2MatchImpl<re2PartialMatch>(name, inputArgs, config);
+  return makeRe2MatchImpl<doPartialMatch>(name, inputArgs, config);
 }
 
 std::vector<std::shared_ptr<exec::FunctionSignature>> re2SearchSignatures() {

@@ -96,6 +96,16 @@ TEST_F(RegexpReplaceTest, withReplacement) {
   EXPECT_THROW(regexpReplace("123", "(?P<digit>\\d)", "${dd}"), VeloxUserError);
   EXPECT_THROW(regexpReplace("123", "(?P<digit>\\d)", "${}"), VeloxUserError);
 
+  // Patterns requiring ICU fallback (Perl-only lookahead syntax).
+  // Thousands separator using positive lookahead.
+  EXPECT_EQ(
+      regexpReplace("1234567", "(\\d)(?=(\\d{3})+$)", "$1,"),
+      "1,234,567");
+  // Negative lookahead.
+  EXPECT_EQ(regexpReplace("foobar", "foo(?!baz)", "X"), "Xbar");
+  // Positive lookahead with replacement group reference.
+  EXPECT_EQ(regexpReplace("abc123", "[a-z]+(?=\\d)", "X"), "X123");
+
   auto input = makeRowVector({
       makeFlatVector<std::string>(
           {"apple123", "1 banana", "orange 23 ...", "12 34 56"}),

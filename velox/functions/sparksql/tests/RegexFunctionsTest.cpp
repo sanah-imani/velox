@@ -171,38 +171,42 @@ class RegexFunctionsTest : public test::SparkFunctionBaseTest {
   }
 };
 
-// A list of known incompatibilities with java.util.regex. Most result in an
-// error being thrown; some unsupported character class features result in
-// different results.
+// Patterns that RE2 does not support are now handled via the ICU fallback
+// engine, so they match rather than throw. Results are consistent with
+// java.util.regex.
 TEST_F(RegexFunctionsTest, javaRegexIncompatibilities) {
-  // Unsupported character classes.
-  EXPECT_THROW(rlike(" ", "\\h"), VeloxUserError);
-  EXPECT_THROW(rlike(" ", "\\H"), VeloxUserError);
-  EXPECT_THROW(rlike(" ", "\\V"), VeloxUserError);
-  EXPECT_THROW(rlike(" ", "\\uffff"), VeloxUserError);
-  EXPECT_THROW(rlike(" ", "\\e"), VeloxUserError);
-  EXPECT_THROW(rlike(" ", "\\c1"), VeloxUserError);
-  EXPECT_THROW(rlike(" ", "\\G"), VeloxUserError);
-  EXPECT_THROW(rlike(" ", "\\Z"), VeloxUserError);
-  EXPECT_THROW(rlike(" ", "\\R"), VeloxUserError);
-  // Backreferences not supported.
-  EXPECT_THROW(rlike("00", R"((\d)\1)"), VeloxUserError);
-  // Possessive quantifiers not supported.
-  EXPECT_THROW(rlike(" ", " ?+"), VeloxUserError);
-  EXPECT_THROW(rlike(" ", " *+"), VeloxUserError);
-  EXPECT_THROW(rlike(" ", " ++"), VeloxUserError);
-  EXPECT_THROW(rlike(" ", " {1}+"), VeloxUserError);
-  // Possessive quantifiers not supported.
-  EXPECT_THROW(rlike(" ", " ?+"), VeloxUserError);
-  EXPECT_THROW(rlike(" ", " *+"), VeloxUserError);
-  EXPECT_THROW(rlike(" ", " ++"), VeloxUserError);
-  EXPECT_THROW(rlike(" ", " {1}+"), VeloxUserError);
-  // Lookahead.
-  EXPECT_THROW(rlike(" ", "(?= )"), VeloxUserError);
-  EXPECT_THROW(rlike(" ", "(?! )"), VeloxUserError);
-  EXPECT_THROW(rlike(" ", "(?<= )"), VeloxUserError);
-  EXPECT_THROW(rlike(" ", "(?<! )"), VeloxUserError);
-  EXPECT_THROW(rlike(" ", "(?<! )"), VeloxUserError);
+  // Character classes handled by ICU.
+  // \h matches horizontal whitespace; space qualifies.
+  EXPECT_EQ(rlike(" ", "\\h"), true);
+  // \H matches non-horizontal-whitespace; space does not qualify.
+  EXPECT_EQ(rlike(" ", "\\H"), false);
+  // \V matches non-vertical-whitespace; space qualifies.
+  EXPECT_EQ(rlike(" ", "\\V"), true);
+  // ￿ matches U+FFFF; does not match a space.
+  EXPECT_EQ(rlike(" ", "\\uffff"), false);
+  // \e matches ESC (U+001B); does not match a space.
+  EXPECT_EQ(rlike(" ", "\\e"), false);
+  // \c1 matches Ctrl+A (U+0001); does not match a space.
+  EXPECT_EQ(rlike(" ", "\\c1"), false);
+  // \G matches at the start of the previous match (or input start); matches.
+  EXPECT_EQ(rlike(" ", "\\G"), true);
+  // \Z matches at end of input as a zero-width assertion; matches.
+  EXPECT_EQ(rlike(" ", "\\Z"), true);
+  // \R matches any Unicode line break; space is not a line break.
+  EXPECT_EQ(rlike(" ", "\\R"), false);
+  // Backreferences: (\d)\1 matches a repeated digit.
+  EXPECT_EQ(rlike("00", R"((\d)\1)"), true);
+  // Possessive quantifiers.
+  EXPECT_EQ(rlike(" ", " ?+"), true);
+  EXPECT_EQ(rlike(" ", " *+"), true);
+  EXPECT_EQ(rlike(" ", " ++"), true);
+  EXPECT_EQ(rlike(" ", " {1}+"), true);
+  // Lookahead and lookbehind.
+  EXPECT_EQ(rlike(" ", "(?= )"), true);
+  // Negative lookahead matches at end of string where no space follows.
+  EXPECT_EQ(rlike(" ", "(?! )"), true);
+  EXPECT_EQ(rlike(" ", "(?<= )"), true);
+  EXPECT_EQ(rlike(" ", "(?<! )"), true);
 }
 
 TEST_F(RegexFunctionsTest, allowSimpleConstantRegex) {
@@ -220,6 +224,16 @@ TEST_F(RegexFunctionsTest, blockUnsupportedEdgeCases) {
   EXPECT_THROW(
       evaluateOnce<bool>("rlike('a', c0)", std::optional<std::string>("a*")),
       VeloxUserError);
+}
+
+TEST_F(RegexFunctionsTest, regexpReplaceWithLookahead) {
+  // Lookahead inserts a thousands separator: 1234567 → 1.234.567.
+  // Pattern requires ICU because RE2 does not support lookaheads.
+  EXPECT_EQ(
+      testRegexpReplace("1234567", R"((\d)(?=(\d{3})+$))", "$1."),
+      "1.234.567");
+  EXPECT_EQ(testRegexpReplace("1000", R"((\d)(?=(\d{3})+$))", "$1."), "1.000");
+  EXPECT_EQ(testRegexpReplace("999", R"((\d)(?=(\d{3})+$))", "$1."), "999");
 }
 
 TEST_F(RegexFunctionsTest, regexMatchRegistration) {

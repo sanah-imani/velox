@@ -209,7 +209,11 @@ struct Split {
         }
       }
     } else {
-      auto* re = cache_.findOrCompile(delimiter);
+      auto compiled = cache_.findOrCompile(delimiter);
+      VELOX_USER_CHECK(
+          !compiled.usesIcu(),
+          "Invalid regular expression: unsupported Perl-only syntax");
+      auto* re = compiled.re2;
       const auto re2String = re2::StringPiece(start, end);
       re2::StringPiece subMatches[1];
       // Matches a regular expression against a portion of the input string,

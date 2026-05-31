@@ -36,7 +36,11 @@ struct Re2RegexpSplit {
       out_type<Array<Varchar>>& out,
       const arg_type<Varchar>& string,
       const arg_type<Varchar>& pattern) {
-    auto* re = cache_.findOrCompile(pattern);
+    auto compiled = cache_.findOrCompile(pattern);
+    VELOX_USER_CHECK(
+        !compiled.usesIcu(),
+        "regexp_split does not support Perl-only regex syntax");
+    auto* re = compiled.re2;
 
     const auto re2String = re2::StringPiece(string.data(), string.size());
 
