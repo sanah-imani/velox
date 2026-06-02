@@ -1556,25 +1556,17 @@ TEST_F(Re2FunctionsTest, likeRegexLimit) {
   verifyNoRegexCompilationForPattern(PatternKind::kRelaxedSuffix);
   verifyNoRegexCompilationForPattern(PatternKind::kSubstring);
 
-  // Over maxCompiledRegexes, all require regex, will fail.
+  // Over maxCompiledRegexes distinct patterns that all require regex compilation.
+  // With LRU eviction the cache stays bounded and all rows complete without
+  // error (evicted entries are recompiled on next access).
   for (auto i = 0; i < aboveMaxCompiledRegexes; i++) {
     std::string localPattern =
         fmt::format("b%[0-9]+.*{}.*{}.*[0-9]+", 'c' + i, 'c' + i);
     flatPattern->set(i, StringView(localPattern));
   }
 
-  VELOX_ASSERT_THROW(
-      evaluate("like(c0, c1)", makeRowVector({input, pattern})),
-      "Max number of regex reached");
-
-  // First maxCompiledRegexes rows should return false, the rest raise and error
-  // and become null.
-  result = evaluate("try(like(c0, c1))", makeRowVector({input, pattern}));
-  auto expected = makeFlatVector<bool>(
-      aboveMaxCompiledRegexes,
-      [](auto /*row*/) { return false; },
-      [&](auto row) { return row >= maxCompiledRegexes; });
-  assertEqualVectors(expected, result);
+  result = evaluate("like(c0, c1)", makeRowVector({input, pattern}));
+  assertEqualVectors(makeConstant(false, aboveMaxCompiledRegexes), result);
 
   // All are complex but the same, should pass.
   for (auto i = 0; i < aboveMaxCompiledRegexes; i++) {

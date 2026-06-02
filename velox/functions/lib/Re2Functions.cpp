@@ -1062,10 +1062,12 @@ class LikeGeneric final : public exec::VectorFunction {
       return reIt->second.get();
     }
 
-    VELOX_USER_CHECK_LT(
-        compiledRegularExpressions_.size(),
-        maxCompiledRegexes_,
-        "Max number of regex reached");
+    // When the cache is full, evict an arbitrary entry rather than throwing.
+    // This keeps the cache bounded while allowing queries with many distinct
+    // runtime LIKE patterns to continue executing.
+    if ((int64_t)compiledRegularExpressions_.size() >= maxCompiledRegexes_) {
+      compiledRegularExpressions_.erase(compiledRegularExpressions_.begin());
+    }
 
     bool validEscapeUsage;
     auto regex = likePatternToRe2(pattern, escapeChar, validEscapeUsage);
