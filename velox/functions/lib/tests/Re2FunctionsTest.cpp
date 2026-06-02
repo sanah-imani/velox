@@ -1513,10 +1513,16 @@ TEST_F(Re2FunctionsTest, likeRegexLimit) {
         return fmt::format("{:%<{}}", "", idx + 1);
       case PatternKind::kFixed:
         return fmt::format("abc{}", idx);
+      case PatternKind::kRelaxedFixed:
+        return fmt::format("a_c{}", idx);
       case PatternKind::kPrefix:
         return fmt::format("abc{}%%", idx);
+      case PatternKind::kRelaxedPrefix:
+        return fmt::format("a_c{}%%", idx);
       case PatternKind::kSuffix:
         return fmt::format("%%{}abc", idx);
+      case PatternKind::kRelaxedSuffix:
+        return fmt::format("%%{}a_c", idx);
       case PatternKind::kSubstring:
         return fmt::format("%%abc{}%%%", idx);
       default:
@@ -1543,8 +1549,11 @@ TEST_F(Re2FunctionsTest, likeRegexLimit) {
   verifyNoRegexCompilationForPattern(PatternKind::kExactlyN);
   verifyNoRegexCompilationForPattern(PatternKind::kAtLeastN);
   verifyNoRegexCompilationForPattern(PatternKind::kFixed);
+  verifyNoRegexCompilationForPattern(PatternKind::kRelaxedFixed);
   verifyNoRegexCompilationForPattern(PatternKind::kPrefix);
+  verifyNoRegexCompilationForPattern(PatternKind::kRelaxedPrefix);
   verifyNoRegexCompilationForPattern(PatternKind::kSuffix);
+  verifyNoRegexCompilationForPattern(PatternKind::kRelaxedSuffix);
   verifyNoRegexCompilationForPattern(PatternKind::kSubstring);
 
   // Over maxCompiledRegexes, all require regex, will fail.
@@ -1573,6 +1582,50 @@ TEST_F(Re2FunctionsTest, likeRegexLimit) {
   }
   result = evaluate("like(c0, c1)", makeRowVector({input, pattern}));
   assertEqualVectors(makeConstant(false, aboveMaxCompiledRegexes), result);
+}
+
+// Verify that dynamic LIKE patterns containing '_' (e.g. concat(col, '%'))
+// do not exhaust the regex cache when the pattern is a kRelaxedPrefix,
+// kRelaxedSuffix, or kRelaxedFixed — these are matched directly without
+// compiling a regex.
+TEST_F(Re2FunctionsTest, likeRelaxedPatternNoRegex) {
+  const auto maxCompiledRegexes =
+      core::QueryConfig({}).exprMaxCompiledRegexes();
+  const auto n = maxCompiledRegexes + 5;
+
+  // Inputs that match their corresponding prefix pattern.
+  auto inputVec = makeFlatVector<std::string>(
+      n, [](auto row) { return fmt::format("/data/table_{}/part", row); });
+
+  // kRelaxedPrefix: pattern ends with '%' and contains '_'.
+  // Each row has a distinct pattern so the old code would have hit the limit.
+  auto prefixPattern = makeFlatVector<std::string>(
+      n, [](auto row) { return fmt::format("/data/table_{}%", row); });
+
+  // kRelaxedSuffix: pattern starts with '%' and contains '_'.
+  auto suffixPattern = makeFlatVector<std::string>(
+      n, [](auto row) { return fmt::format("%table_{}/part", row); });
+
+  // kRelaxedFixed: no wildcards except '_'.
+  auto fixedPattern = makeFlatVector<std::string>(
+      n, [](auto row) { return fmt::format("/data/table_{}/part", row); });
+
+  // All three should succeed (no "Max number of regex reached") and return true.
+  VectorPtr result;
+  ASSERT_NO_THROW(
+      result = evaluate(
+          "like(c0, c1)", makeRowVector({inputVec, prefixPattern})));
+  assertEqualVectors(makeConstant(true, n), result);
+
+  ASSERT_NO_THROW(
+      result = evaluate(
+          "like(c0, c1)", makeRowVector({inputVec, suffixPattern})));
+  assertEqualVectors(makeConstant(true, n), result);
+
+  ASSERT_NO_THROW(
+      result = evaluate(
+          "like(c0, c1)", makeRowVector({inputVec, fixedPattern})));
+  assertEqualVectors(makeConstant(true, n), result);
 }
 
 TEST_F(Re2FunctionsTest, invalidEscapeChar) {

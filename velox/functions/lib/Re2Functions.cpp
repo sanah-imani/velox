@@ -961,12 +961,21 @@ class LikeGeneric final : public exec::VectorFunction {
           case PatternKind::kFixed:
             return OptimizedLike<PatternKind::kFixed>::match</*isAscii*/ true>(
                 input, patternMetadata);
+          case PatternKind::kRelaxedFixed:
+            return OptimizedLike<PatternKind::kRelaxedFixed>::match<
+                /*isAscii*/ true>(input, patternMetadata);
           case PatternKind::kPrefix:
             return OptimizedLike<PatternKind::kPrefix>::match</*isAscii*/ true>(
                 input, patternMetadata);
+          case PatternKind::kRelaxedPrefix:
+            return OptimizedLike<PatternKind::kRelaxedPrefix>::match<
+                /*isAscii*/ true>(input, patternMetadata);
           case PatternKind::kSuffix:
             return OptimizedLike<PatternKind::kSuffix>::match</*isAscii*/ true>(
                 input, patternMetadata);
+          case PatternKind::kRelaxedSuffix:
+            return OptimizedLike<PatternKind::kRelaxedSuffix>::match<
+                /*isAscii*/ true>(input, patternMetadata);
           case PatternKind::kSubstring:
             return OptimizedLike<PatternKind::kSubstring>::match<
                 /*isAscii*/ true>(input, patternMetadata);
@@ -984,11 +993,20 @@ class LikeGeneric final : public exec::VectorFunction {
           case PatternKind::kFixed:
             return OptimizedLike<PatternKind::kFixed>::match</*isAscii*/ false>(
                 input, patternMetadata);
+          case PatternKind::kRelaxedFixed:
+            return OptimizedLike<PatternKind::kRelaxedFixed>::match<
+                /*isAscii*/ false>(input, patternMetadata);
           case PatternKind::kPrefix:
             return OptimizedLike<PatternKind::kPrefix>::match<
                 /*isAscii*/ false>(input, patternMetadata);
+          case PatternKind::kRelaxedPrefix:
+            return OptimizedLike<PatternKind::kRelaxedPrefix>::match<
+                /*isAscii*/ false>(input, patternMetadata);
           case PatternKind::kSuffix:
             return OptimizedLike<PatternKind::kSuffix>::match<
+                /*isAscii*/ false>(input, patternMetadata);
+          case PatternKind::kRelaxedSuffix:
+            return OptimizedLike<PatternKind::kRelaxedSuffix>::match<
                 /*isAscii*/ false>(input, patternMetadata);
           case PatternKind::kSubstring:
             return OptimizedLike<PatternKind::kSubstring>::match<
